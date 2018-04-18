@@ -47,5 +47,8 @@ func addKnownTypes(scheme *runtime.Scheme) error {
 	scheme.AddKnownTypes(SchemeGroupVersion,
 		&KubeletConfiguration{},
 	)
+	scheme.AddKnownTypes(SchemeGroupVersion,
+		&KubeletInstanceConfiguration{},
+	)
 	return nil
 }

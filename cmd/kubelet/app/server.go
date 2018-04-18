@@ -111,6 +111,11 @@ func NewKubeletCommand() *cobra.Command {
 	if err != nil {
 		glog.Fatal(err)
 	}
+	kubeletInstanceConfig, err := options.NewKubeletInstanceConfiguration()
+	// programmer error
+	if err != nil {
+		glog.Fatal(err)
+	}
 
 	cmd := &cobra.Command{
 		Use: componentKubelet,
@@ -175,16 +180,18 @@ HTTP server: The kubelet can also listen for HTTP and respond to a simple API
 				if err != nil {
 					glog.Fatal(err)
 				}
-				// We must enforce flag precedence by re-parsing the command line into the new object.
-				// This is necessary to preserve backwards-compatibility across binary upgrades.
-				// See issue #56171 for more details.
-				if err := kubeletConfigFlagPrecedence(kubeletConfig, args); err != nil {
+
+				kubeletFlagPrecedenceWithUpdateFeatureGates(kubeletConfig, kubeletInstanceConfig, args)
+			}
+
+			// load kubelet instance config file, if provided
+			if instanceConfigFile := kubeletFlags.KubeletInstanceConfigFile; len(instanceConfigFile) > 0 {
+				kubeletInstanceConfig, err = loadInstanceConfigFile(instanceConfigFile)
+				if err != nil {
 					glog.Fatal(err)
 				}
-				// update feature gates based on new config
-				if err := utilfeature.DefaultFeatureGate.SetFromMap(kubeletConfig.FeatureGates); err != nil {
-					glog.Fatal(err)
-				}
+
+				kubeletFlagPrecedenceWithUpdateFeatureGates(kubeletConfig, kubeletInstanceConfig, args)
 			}
 
 			// use dynamic kubelet config, if enabled
@@ -194,22 +201,15 @@ HTTP server: The kubelet can also listen for HTTP and respond to a simple API
 				if err != nil {
 					glog.Fatal(err)
 				}
-				// We must enforce flag precedence by re-parsing the command line into the new object.
-				// This is necessary to preserve backwards-compatibility across binary upgrades.
-				// See issue #56171 for more details.
-				if err := kubeletConfigFlagPrecedence(kubeletConfig, args); err != nil {
-					glog.Fatal(err)
-				}
-				// update feature gates based on new config
-				if err := utilfeature.DefaultFeatureGate.SetFromMap(kubeletConfig.FeatureGates); err != nil {
-					glog.Fatal(err)
-				}
+
+				kubeletFlagPrecedenceWithUpdateFeatureGates(kubeletConfig, kubeletInstanceConfig, args)
 			}
 
 			// construct a KubeletServer from kubeletFlags and kubeletConfig
 			kubeletServer := &options.KubeletServer{
-				KubeletFlags:         *kubeletFlags,
-				KubeletConfiguration: *kubeletConfig,
+				KubeletFlags:                 *kubeletFlags,
+				KubeletConfiguration:         *kubeletConfig,
+				KubeletInstanceConfiguration: *kubeletInstanceConfig,
 			}
 
 			// use kubeletServer to construct the default KubeletDeps
@@ -239,6 +239,7 @@ HTTP server: The kubelet can also listen for HTTP and respond to a simple API
 	// keep cleanFlagSet separate, so Cobra doesn't pollute it with the global flags
 	kubeletFlags.AddFlags(cleanFlagSet)
 	options.AddKubeletConfigFlags(cleanFlagSet, kubeletConfig)
+	options.AddKubeletInstanceConfigFlags(cleanFlagSet, kubeletInstanceConfig)
 	options.AddGlobalFlags(cleanFlagSet)
 	cleanFlagSet.BoolP("help", "h", false, fmt.Sprintf("help for %s", cmd.Name()))
 
@@ -277,11 +278,23 @@ func newFakeFlagSet(fs *pflag.FlagSet) *pflag.FlagSet {
 	return ret
 }
 
-// kubeletConfigFlagPrecedence re-parses flags over the KubeletConfiguration object.
+// kubeletFlagPrecedenceWithUpdateFeatureGates re-parses flags over the KubeletConfiguration and KubeletInstanceConfiguration object.
+// And, update feature gates based on new config
+func kubeletFlagPrecedenceWithUpdateFeatureGates(kc *kubeletconfiginternal.KubeletConfiguration, kic *kubeletconfiginternal.KubeletInstanceConfiguration, args []string) error {
+	kubeletFlagPrecedence(kc, kic, args)
+
+	// update feature gates based on new config
+	if err := utilfeature.DefaultFeatureGate.SetFromMap(kc.FeatureGates); err != nil {
+		glog.Fatal(err)
+	}
+	return nil
+}
+
+// kubeletFlagPrecedence re-parses flags over the KubeletConfiguration and KubeletInstanceConfiguration object.
 // We must enforce flag precedence by re-parsing the command line into the new object.
 // This is necessary to preserve backwards-compatibility across binary upgrades.
 // See issue #56171 for more details.
-func kubeletConfigFlagPrecedence(kc *kubeletconfiginternal.KubeletConfiguration, args []string) error {
+func kubeletFlagPrecedence(kc *kubeletconfiginternal.KubeletConfiguration, kic *kubeletconfiginternal.KubeletInstanceConfiguration, args []string) error {
 	// We use a throwaway kubeletFlags and a fake global flagset to avoid double-parses,
 	// as some Set implementations accumulate values from multiple flag invocations.
 	fs := newFakeFlagSet(newFlagSetWithGlobals())
@@ -289,6 +302,8 @@ func kubeletConfigFlagPrecedence(kc *kubeletconfiginternal.KubeletConfiguration,
 	options.NewKubeletFlags().AddFlags(fs)
 	// register new KubeletConfiguration
 	options.AddKubeletConfigFlags(fs, kc)
+	// register new KubeletInstanceConfiguration
+	options.AddKubeletInstanceConfigFlags(fs, kic)
 	// Remember original feature gates, so we can merge with flag gates later
 	original := kc.FeatureGates
 	// re-parse flags
@@ -315,11 +330,29 @@ func loadConfigFile(name string) (*kubeletconfiginternal.KubeletConfiguration, e
 	if err != nil {
 		return nil, fmt.Errorf(errFmt, name, err)
 	}
-	kc, err := loader.Load()
+	kc, err := loader.LoadKubeletConfiguration()
 	if err != nil {
 		return nil, fmt.Errorf(errFmt, name, err)
 	}
 	return kc, err
+}
+
+func loadInstanceConfigFile(name string) (*kubeletconfiginternal.KubeletInstanceConfiguration, error) {
+	const errFmt = "failed to load Kubelet instance config file %s, error %v"
+	// compute absolute path based on current working dir
+	kubeletInstanceConfigFile, err := filepath.Abs(name)
+	if err != nil {
+		return nil, fmt.Errorf(errFmt, name, err)
+	}
+	loader, err := configfiles.NewFsLoader(utilfs.DefaultFs{}, kubeletInstanceConfigFile)
+	if err != nil {
+		return nil, fmt.Errorf(errFmt, name, err)
+	}
+	kic, err := loader.LoadKubeletInstanceConfiguration()
+	if err != nil {
+		return nil, fmt.Errorf(errFmt, name, err)
+	}
+	return kic, err
 }
 
 // UnsecuredDependencies returns a Dependencies suitable for being run, or an error if the server setup
